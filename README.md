@@ -25,8 +25,8 @@ and extracts likely healthcare-related expenses into a clean Excel summary.
 
 | Date | Company | Amount |
 |------|------|------|
-| 01/04/2025 | MASS GENERAL BRIGHAM | 45.00 |
-| 01/08/2025 | CVS/PHARMACY | 12.99 |
+| XX/XX/XXXX | COMPANY | XX.XX |
+| XX/XX/XXXX | COMPANY | XX.XX |
 
 ## Technologies Used
 
