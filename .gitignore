@@ -1,0 +1,17 @@
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+.DS_Store
+
+output/
+processed_files/
+
+merchant_memory.csv
+healthcare_merchants.csv
+
+*.xlsx
+*.xls
+
+.env
