@@ -1,403 +1,282 @@
-from pathlib import Path
 import re
-import time
-import shutil
-import hashlib
-import pandas as pd
+from pathlib import Path
 import pdfplumber
-import requests
-from bs4 import BeautifulSoup
-from numbers_parser import Document
+import pandas as pd
+import sys
+import os
 
 # ==============================
-# PATHS
+# BASE PATH (WORKS FOR EXE + SCRIPT)
 # ==============================
-
-BASE_DIR = Path.home() / "Desktop" / "ExpensesTool"
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent
 
 INPUT_DIR = BASE_DIR / "input_files"
-PROCESSED_DIR = BASE_DIR / "processed_files"
 OUTPUT_DIR = BASE_DIR / "output"
-
-MASTER_FILE = OUTPUT_DIR / "Healthcare_Expenses_Master.xlsx"
-MERCHANT_FILE = BASE_DIR / "healthcare_merchants.csv"
-LOG_FILE = OUTPUT_DIR / "processing_log.txt"
-
-SUPPORTED_FILES = [".csv", ".xlsx", ".xls", ".pdf", ".numbers"]
+OUTPUT_FILE = OUTPUT_DIR / "Healthcare_Expenses_Master.xlsx"
 
 # ==============================
-# DEFAULT MERCHANTS
+# 🚨 ENSURE DIRECTORIES (BULLETPROOF)
 # ==============================
-
-DEFAULT_HEALTHCARE_MERCHANTS = [
-    "MASS GENERAL", "BRIGHAM", "MGH",
-    "ATRIUS", "CVS", "WALGREENS",
-    "PHARMACY", "DENT", "DERM",
-    "CHIROPRACT", "MEDICAL", "HOSPITAL",
-    "SURGI", "ORTHOPEDIC",
-    "JOHNSON COMPOUNDING",
-    "BOYLSTON STREET DENT",
-    "KRAUSS DERMATOLOGY",
-    "MOVE WELL", "NEWTON WELLESLEY",
-    "BLUE CROSS", "BCBS",
-    "TRINET", "TRINET3",
-    "HIGHEND CARE", "HIGH END CARE"
-]
-
-# ==============================
-# LOGGING
-# ==============================
-
-def log(message):
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
-
-# ==============================
-# SETUP
-# ==============================
-
-def ensure_folders():
-    INPUT_DIR.mkdir(exist_ok=True)
-    PROCESSED_DIR.mkdir(exist_ok=True)
-    OUTPUT_DIR.mkdir(exist_ok=True)
-
-    if not MERCHANT_FILE.exists():
-        pd.DataFrame({"merchant_name": DEFAULT_HEALTHCARE_MERCHANTS}).to_csv(
-            MERCHANT_FILE, index=False
-        )
-
-# ==============================
-# CLEANING
-# ==============================
-
-def clean_amount(value):
-    if pd.isna(value):
-        return None
-
-    text = str(value).replace("$", "").replace(",", "")
-    text = text.replace("(", "-").replace(")", "").strip()
-
+def ensure_directories():
     try:
-        return float(text)
-    except ValueError:
-        return None
+        INPUT_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+        print("\n📂 DIRECTORY CHECK")
+        print(f"BASE DIR: {BASE_DIR.resolve()}")
+        print(f"INPUT DIR: {INPUT_DIR.resolve()}")
+        print(f"OUTPUT DIR: {OUTPUT_DIR.resolve()}")
 
-def clean_company_name(value):
-    text = str(value).strip()
+        # sanity check
+        print("\n📁 Contents of BASE DIR:")
+        print(list(BASE_DIR.iterdir()))
+
+    except Exception as e:
+        print(f"❌ Failed to create directories: {e}")
+
+# ==============================
+# CLEAN COMPANY NAME
+# ==============================
+def clean_company_name(text):
+    text = text.upper()
+
+    text = re.sub(r"^(CHECKCARD|POS|ACH|DEBIT)\s+\d+\s*", "", text)
+    text = re.sub(r"\d{6,}", "", text)
+    text = re.sub(r"\d{3}-\d{3}-\d{4}", "", text)
+    # Fix merged pharmacy names
+    text = re.sub(r"(CVS)(PHARMACY)", r"\1 \2", text)
+    text = re.sub(r"(WALGREENS)(PHARMACY)", r"\1 \2", text)
+
+    # fix duplicated words
+    text = re.sub(r"\b(\w+)\s+\1\b", r"\1", text)
+
     text = re.sub(r"\s+", " ", text)
-    text = text.replace("AplPay ", "")
-    return text
+
+    return text.strip()
 
 # ==============================
-# MERCHANT LOGIC
+# FILTER OUT NON-REAL TRANSACTIONS
 # ==============================
+def is_valid_company(company):
+    bad = [
+        "ATM", "WITHDRWL", "ZELLE", "TRANSFER",
+        "DEPOSIT", "VENMO", "PAYMENT",
+        "BANK OF AMERICA", "UMASS STORE"
+    ]
+    return not any(b in company for b in bad)
 
-def load_healthcare_merchants():
-    df = pd.read_csv(MERCHANT_FILE)
-    return [str(v).upper().strip() for v in df["merchant_name"].dropna()]
+def is_false_positive(company):
+    bad = [
+        "MASS BAY",      # bookstore
+        "BKST",          # bookstore shorthand
+        "TAX",
+        "DEPARTME",
+        "REFUND",
+        "TREASURY"
+    ]
+    return any(b in company for b in bad)
 
+# ==============================
+# HEALTHCARE FILTER (BALANCED)
+# ==============================
+def is_healthcare(company):
+    text = company.upper()
 
-def check_online_healthcare(company_name):
-    query = f"{company_name} healthcare medical insurance provider"
-    url = "https://duckduckgo.com/html/"
+    keywords = [
+        # pharmacies
+        "CVS", "WALGREEN", "RITE AID", "PHARM",
 
-    try:
-        response = requests.post(
-            url,
-            data={"q": query},
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=6
-        )
+        # providers (specific only)
+        "ATRIUS",
+        "MASS GENERAL",
+        "BRIGHAM",
+        "PARTNERS",
+        "NEWTON WELLESLEY",
+        "MOUNT AUBURN",
+        "UMASS HEALTH",
+        "UMA PHARMACY",
 
-        if response.status_code != 200:
-            return False
+        # specialties
+        "DERM",
+        "VISION",
+        "DENTAL",
+        "CARE",
+        "CLINIC",
+        "HOSPITAL",
 
-        soup = BeautifulSoup(response.text, "html.parser")
-        text = soup.get_text(" ", strip=True).lower()
+        # labs
+        "LABCORP", "QUEST",
 
-        keywords = [
-            "healthcare", "medical", "clinic",
-            "hospital", "physician",
-            "insurance", "pharmacy", "dental"
-        ]
-
-        return sum(k in text for k in keywords) >= 2
-
-    except Exception:
-        return False
-
-
-def normalize(text):
-    return re.sub(r'[^A-Z0-9]', '', str(text).upper())
-
-
-def is_healthcare_company(company_name):
-    company_raw = str(company_name).upper()
-    company_norm = normalize(company_name)
-
-    EXCLUDED_TERMS = [
-        "VETERINARY", "VET", "ANIMAL",
-        "NSTAR", "NATIONALGRID", "SPEEDWAY",
-        "GAS", "ELECTRIC", "UTILITY",
-        "MARKETBASKET", "STOPSHOP",
-        "UBER", "LYFT", "SHELL", "MOBIL"
+        # retail medical
+        "WARBY"
     ]
 
-    # Normalize exclusions too
-    if any(normalize(term) in company_norm for term in EXCLUDED_TERMS):
-        return False
-
-    merchants = load_healthcare_merchants()
-
-    # Normalize merchant list too
-    for m in merchants:
-        if normalize(m) in company_norm:
-            return True
-
-    # fallback for tricky known patterns
-    if any(x in company_norm for x in ["BCBS", "BLUECROSS", "TRINET", "HIGHENDCARE"]):
-        return True
-
-    # smart online fallback (only when needed)
-    LIKELY = ["HEALTH", "CARE", "MED", "CLINIC", "RX", "INSURANCE"]
-
-    if any(w in company_raw for w in LIKELY):
-        if check_online_healthcare(company_name):
-            # auto-learn
-            df = pd.read_csv(MERCHANT_FILE)
-            df.loc[len(df)] = [company_raw]
-            df.to_csv(MERCHANT_FILE, index=False)
-            return True
-
-    return False
+    return any(k in text for k in keywords)
 
 # ==============================
-# PROCESSING
+# ROBUST PDF PARSER
 # ==============================
-
-def get_row_value(row, names):
-    for name in names:
-        if name in row and pd.notna(row[name]):
-            return row[name]
-    return ""
-
-
-def process_csv_or_excel(file_path):
-    df = pd.read_csv(file_path) if file_path.suffix == ".csv" else pd.read_excel(file_path)
-
+def parse_pdf(file_path):
     rows = []
 
-    for _, row in df.iterrows():
-        company = clean_company_name(get_row_value(row, ["Description","Merchant","Name"]))
-        date = get_row_value(row, ["Date"])
-        amount = clean_amount(get_row_value(row, ["Amount"]))
+    try:
+        with pdfplumber.open(file_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text()
 
-        if company and amount is not None and is_healthcare_company(company):
-            rows.append({"Date": date, "Company": company, "Amount": amount})
-
-    return pd.DataFrame(rows)
-
-
-def parse_pdf_transaction_line(line):
-    # Match: 03/06/25 UMA PHARMACY AMHERST, MA 5.68
-    pattern = r"(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(-?\d+\.\d{2})\s*$"
-    match = re.search(pattern, line)
-
-    if not match:
-        return None
-
-    date = match.group(1)
-    amount = float(match.group(3))
-
-    # Extract company by removing location (last comma section)
-    desc = match.group(2)
-    company = desc.split(",")[0]  # remove "AMHERST, MA"
-
-    return {
-        "Date": date,
-        "Company": clean_company_name(company),
-        "Amount": amount
-    }
-
-
-def process_pdf(file_path):
-    rows = []
-    in_health_section = False
-
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-
-            for line in text.split("\n"):
-
-                # START section
-                if any(x in line for x in ["Health Care", "Pharmacy", "Health $"]):
-                    in_health_section = True
+                if not text:
                     continue
 
-                # STOP section
-                if any(x in line for x in [
-                    "Travel and Transportation",
-                    "Services",
-                    "Merchandise",
-                    "Entertainment",
-                    "Food Store"
-                ]):
-                    in_health_section = False
+                for line in text.split("\n"):
+                    line = line.strip()
 
-                parsed = parse_pdf_transaction_line(line)
+                    # =========================
+                    # PRIMARY REGEX PARSE
+                    # =========================
+                    match = re.search(
+                        r"(\d{2}/\d{2}/\d{2})\s+(.*?)\s+(-?\d+\.\d{2})\s*$",
+                        line
+                    )
 
-                if parsed:
-                    if in_health_section or is_healthcare_company(parsed["Company"]):
-                        rows.append(parsed)
+                    if match:
+                        date = match.group(1)
+                        company_raw = match.group(2)
+                        amount_raw = match.group(3)
 
-    return pd.DataFrame(rows)
+                        # Remove CR/DR or any non-numeric characters
+                        amount_clean = re.sub(r"[^\d\.\-]", "", amount_raw)
 
-def extract_pdf_totals(file_path):
-    health_total = None
-    pharmacy_total = None
+                        try:
+                            amount = float(amount_clean)
+                        except:
+                            continue
 
-    with pdfplumber.open(file_path) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
+                        company = clean_company_name(company_raw)
 
-            # Match: Health Care $702.74
-            health_match = re.search(r"Health Care\s+\$?([\d,]+\.\d{2})", text)
-            if health_match:
-                health_total = float(health_match.group(1).replace(",", ""))
+                        rows.append({
+                            "Date": date,
+                            "Company": company,
+                            "Amount": amount
+                        })
 
-            # Match: Pharmacy $163.38
-            pharm_match = re.search(r"Pharmacy\s+\$?([\d,]+\.\d{2})", text)
-            if pharm_match:
-                pharmacy_total = float(pharm_match.group(1).replace(",", ""))
+                    # =========================
+                    # FALLBACK PARSE
+                    # =========================
+                    else:
+                        parts = line.split()
 
-    return health_total, pharmacy_total
+                        if len(parts) >= 3:
+                            if (
+                                re.match(r"\d{2}/\d{2}/\d{2}", parts[0]) and
+                                re.match(r"-?\d+\.\d{2}", parts[-1])
+                            ):
+                                date = parts[0]
+                                amount_raw = parts[-1]
+                                amount_clean = re.sub(r"[^\d\.\-]", "", amount_raw)
 
-def reconcile_totals(df, pdf_file):
-    extracted_total = df["Amount"].sum()
+                                try:
+                                    amount = float(amount_clean)
+                                except:
+                                    continue
 
-    health_total, pharmacy_total = extract_pdf_totals(pdf_file)
+                                company_raw = " ".join(parts[1:-1])
 
-    expected_total = 0
-    if health_total:
-        expected_total += health_total
-    if pharmacy_total:
-        expected_total += pharmacy_total
+                                company = clean_company_name(company_raw)
 
-    print("\n===== RECONCILIATION =====")
-    print(f"Extracted total: ${extracted_total:.2f}")
-    print(f"Expected total:  ${expected_total:.2f}")
+                                rows.append({
+                                    "Date": date,
+                                    "Company": company,
+                                    "Amount": amount
+                                })
 
-    diff = round(expected_total - extracted_total, 2)
-
-    if abs(diff) < 0.01:
-        print("✅ MATCH — All transactions captured\n")
-    else:
-        print(f"❌ MISMATCH — Missing ${diff:.2f}\n")
-
-def process_numbers(file_path):
-    doc = Document(str(file_path))
-    rows = []
-
-    for sheet in doc.sheets:
-        for table in sheet.tables:
-            data = table.rows(values_only=True)
-
-            for row in data[1:]:
-                # Combine entire row into text
-                row_text = " ".join([str(v) for v in row if v is not None])
-
-                if not row_text.strip():
-                    continue
-
-                first_line = row_text.split("\n")[0].strip()
-
-                # Clean company
-                company = clean_company_name(first_line)
-
-                date_match = re.search(r"\d{2}/\d{2}/\d{4}", row_text)
-                date = date_match.group(0) if date_match else ""
-
-                nums = [float(v) for v in row if isinstance(v, (int, float)) and abs(v) > 0.01]
-
-                amount = max(nums, key=abs) if nums else 0.0
-
-                if not company:
-                    continue
-
-                if is_healthcare_company(company):
-                    rows.append({
-                        "Date": date,
-                        "Company": company,
-                        "Amount": amount
-                    })
+    except Exception as e:
+        print(f"❌ Error parsing {file_path.name}: {e}")
 
     return pd.DataFrame(rows)
 
 # ==============================
-# OUTPUT
+# MAIN PROCESSOR
 # ==============================
+def process_all_files():
+    print("\n🚀 Processing files...")
+    print(f"Looking in: {INPUT_DIR.resolve()}")
 
-def append_to_master(new_data):
-    if new_data.empty:
+    files = list(INPUT_DIR.glob("*.pdf"))
+
+    print(f"\n📄 FILES FOUND: {len(files)}")
+
+    if not files:
+        print("❌ No PDF files found in input_files/")
         return
 
-    if MASTER_FILE.exists():
-        existing = pd.read_excel(MASTER_FILE)
-        combined = pd.concat([existing, new_data], ignore_index=True)
-    else:
-        combined = new_data
+    all_data = []
 
-    combined = combined.drop_duplicates(subset=["Date","Company","Amount"])
+    for file in sorted(files):
+        print(f"\n--- Processing {file.name} ---")
 
-    total = combined["Amount"].sum()
+        df = parse_pdf(file)
 
-    total_row = pd.DataFrame([{
-        "Date": "",
-        "Company": "TOTAL",
-        "Amount": round(total, 2)
-    }])
+        if df.empty:
+            print("⚠️ No transactions found")
+            continue
 
-    combined = pd.concat([combined, total_row], ignore_index=True)
-    combined.to_excel(MASTER_FILE, index=False)
+        print(f"✅ Parsed {len(df)} transactions")
 
-# ==============================
-# RUNNER
-# ==============================
+        df["Source File"] = file.name
+        all_data.append(df)
 
-def process_file(file_path):
-    log(f"Processing {file_path.name}")
-
-    suffix = file_path.suffix.lower()
-
-    if suffix in [".csv",".xlsx",".xls"]:
-        data = process_csv_or_excel(file_path)
-    elif suffix == ".pdf":
-        data = process_pdf(file_path)
-    elif suffix == ".numbers":
-        data = process_numbers(file_path)
-    else:
+    if not all_data:
+        print("❌ No data extracted")
         return
 
-    if suffix == ".pdf":
-        data = process_pdf(file_path)
+    final_df = pd.concat(all_data, ignore_index=True)
 
-    if not data.empty:
-        reconcile_totals(data, file_path)
+    print(f"\n📊 Total transactions before filtering: {len(final_df)}")
 
-    append_to_master(data)
+    # ==============================
+    # CLEAN DATA
+    # ==============================
+    final_df = final_df[
+        final_df["Company"].apply(is_valid_company) &
+        ~final_df["Company"].apply(is_false_positive)
+    ]
 
-    shutil.move(str(file_path), PROCESSED_DIR / file_path.name)
+    print(f"After removing junk: {len(final_df)}")
 
+    # ==============================
+    # HEALTHCARE FILTER
+    # ==============================
+    final_df["Is Healthcare"] = final_df["Company"].apply(is_healthcare)
 
-def process_existing_files():
-    for f in sorted(INPUT_DIR.iterdir()):
-        if f.suffix.lower() in SUPPORTED_FILES:
-            process_file(f)
+    healthcare_df = final_df[final_df["Is Healthcare"]].copy()
 
+    print(f"Healthcare transactions found: {len(healthcare_df)}")
 
+    if healthcare_df.empty:
+        print("⚠️ No healthcare transactions found")
+        return
+
+    healthcare_df = healthcare_df.drop(columns=["Is Healthcare"])
+
+    # ==============================
+    # SAVE OUTPUT
+    # ==============================
+    try:
+        healthcare_df.to_excel(OUTPUT_FILE, index=False)
+        print(f"\n✅ OUTPUT SAVED → {OUTPUT_FILE.resolve()}")
+        print(f"💰 Total Healthcare Spend: ${round(healthcare_df['Amount'].sum(), 2)}")
+
+    except Exception as e:
+        print(f"❌ Failed to save Excel: {e}")
+
+# ==============================
+# RUN
+# ==============================
 if __name__ == "__main__":
-    ensure_folders()
-    process_existing_files()
+    print("\n=== Healthcare Expense Tool Starting ===")
+    ensure_directories()
+    process_all_files()
+    print("\n=== Done ===")
